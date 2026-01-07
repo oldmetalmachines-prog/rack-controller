@@ -1,0 +1,18 @@
+services:
+  gha-runner:
+    build:
+      context: .
+      dockerfile: docker/runner/Dockerfile
+    container_name: gha-runner
+    restart: unless-stopped
+    environment:
+      GITHUB_OWNER: "oldmetalmachines-prog"
+      GITHUB_REPO: "rack-controller"
+      RUNNER_TOKEN: "${RUNNER_TOKEN}"
+      RUNNER_NAME: "g3-runner-01"
+      RUNNER_LABELS: "g3,linux,x86_64,usb-flash"
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./_runner_work:/home/runner/actions-runner/_work
+      - /dev:/dev

@@ -1,0 +1,74 @@
+name: build-test-flash
+
+on:
+  push:
+    branches: [ "master" ]
+  workflow_dispatch:
+    inputs:
+      do_flash:
+        description: "Run flashing step"
+        required: true
+        default: "false"
+      port:
+        description: "USB serial port (e.g., /dev/ttyUSB0 or /dev/ttyACM0)"
+        required: false
+        default: "/dev/ttyUSB0"
+      target:
+        description: "Flash target (esp32)"
+        required: true
+        default: "esp32"
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: bash scripts/build.sh
+
+      - name: Test
+        run: bash scripts/test.sh
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: firmware/
+
+  flash_on_g3:
+    needs: build_and_test
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.do_flash == 'true' }}
+    runs-on: [self-hosted, g3, usb-flash]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download firmware artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: firmware/
+
+      - name: Build flasher image
+        run: docker build -t md-flasher:local -f docker/flasher/Dockerfile .
+
+      - name: Flash (ESP32)
+        if: ${{ inputs.target == 'esp32' }}
+        run: |
+          docker run --rm --privileged \
+            -v /dev:/dev \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            md-flasher:local \
+            "bash scripts/flash_esp32.sh '${{ inputs.port }}' 921600 firmware/firmware.bin"
+
+      - name: Verify serial output
+        run: |
+          docker run --rm --privileged \
+            -v /dev:/dev \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e PORT="${{ inputs.port }}" \
+            -e SECONDS="8" \
+            md-flasher:local \
+            "bash scripts/verify_serial.sh '${{ inputs.port }}' 8"
