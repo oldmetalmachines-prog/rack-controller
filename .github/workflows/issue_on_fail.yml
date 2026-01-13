@@ -1,0 +1,120 @@
+# Auto-create GitHub Issue on HIL Failure
+# Creates structured issues for AI-assisted debugging
+#
+# Triggers: When HIL workflow completes with failure
+
+name: Create Issue on Failure
+
+on:
+  workflow_run:
+    workflows: ["HIL Tests"]
+    types:
+      - completed
+
+jobs:
+  create_issue:
+    name: Create Failure Issue
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    
+    permissions:
+      issues: write
+      actions: read
+    
+    steps:
+      - name: Get workflow run details
+        id: run_info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            
+            // Get failed jobs
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: run.id
+            });
+            
+            const failedJobs = jobs.data.jobs
+              .filter(job => job.conclusion === 'failure')
+              .map(job => job.name);
+            
+            return {
+              run_id: run.id,
+              run_url: run.html_url,
+              head_sha: run.head_sha,
+              head_branch: run.head_branch,
+              failed_jobs: failedJobs,
+              actor: run.actor.login,
+              event: run.event
+            };
+      
+      - name: Create issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const info = ${{ steps.run_info.outputs.result }};
+            
+            const failedJobsList = info.failed_jobs.length > 0
+              ? info.failed_jobs.map(j => `- ${j}`).join('\n')
+              : '- Unknown (check workflow run)';
+            
+            const issueBody = `
+            ## HIL Test Failure Report
+            
+            A Hardware-in-the-Loop test has failed and requires investigation.
+            
+            ### Failure Details
+            
+            | Field | Value |
+            |-------|-------|
+            | **Workflow Run** | [#${info.run_id}](${info.run_url}) |
+            | **Commit** | \`${info.head_sha}\` |
+            | **Branch** | \`${info.head_branch}\` |
+            | **Triggered by** | @${info.actor} |
+            | **Event** | \`${info.event}\` |
+            
+            ### Failed Jobs
+            
+            ${failedJobsList}
+            
+            ### Logs
+            
+            Check the [workflow run](${info.run_url}) for detailed logs and artifacts.
+            
+            ---
+            
+            ### Instructions for AI Fix
+            
+            To investigate and fix this issue:
+            
+            1. **Review the failure logs** from the workflow run artifacts
+            2. **Identify the failure mode**:
+               - Build failure → Check compiler errors
+               - Flash failure → Check port availability, device connection
+               - Serial validation failure → Check boot contract JSON format
+               - MQTT validation failure → Check network/broker connectivity
+            3. **Common fixes**:
+               - Timeout issues: Increase timeout values in validation scripts
+               - Connection issues: Verify device ports and udev rules
+               - Boot contract: Ensure JSON is printed within 10 seconds
+            4. **Create a PR** with the fix and reference this issue
+            
+            ### Checklist
+            
+            - [ ] Root cause identified
+            - [ ] Fix implemented
+            - [ ] PR created and linked
+            - [ ] HIL tests passing
+            `;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[CI] HIL Test Failure - ${info.head_sha.substring(0, 7)}`,
+              body: issueBody,
+              labels: ['ci-failure', 'ai-fix-needed']
+            });
+            
+            console.log('Issue created successfully');

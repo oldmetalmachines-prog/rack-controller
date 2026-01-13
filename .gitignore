@@ -1,0 +1,39 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# ESP-IDF
+build/
+sdkconfig
+sdkconfig.old
+
+# Logs
+logs/
+
+# Secrets (never commit)
+secrets.h
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.bin
+*.elf
+*.map

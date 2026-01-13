@@ -1,0 +1,171 @@
+# Manual Release Flash Workflow
+# Manually flash firmware to staging devices
+#
+# Triggers: Manual dispatch only (workflow_dispatch)
+# Runner: ZimaBlade #2 (flash runner)
+
+name: Release Flash
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target device type'
+        required: true
+        type: choice
+        options:
+          - s3
+          - cyd
+          - p4
+      device_port:
+        description: 'Device serial port (e.g., /dev/ttyUSB0)'
+        required: true
+        type: string
+      environment:
+        description: 'Build environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - release
+        default: 'release'
+      run_validation:
+        description: 'Run post-flash validation'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  MQTT_BROKER: homelab.local
+  MQTT_PORT: 1883
+
+jobs:
+  flash_staging:
+    name: Flash ${{ inputs.target }} to Staging
+    runs-on: [self-hosted, linux, x64, flash]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio pyserial paho-mqtt
+      
+      - name: Validate device port exists
+        run: |
+          if [[ ! -e "${{ inputs.device_port }}" ]]; then
+            echo "Error: Device port ${{ inputs.device_port }} does not exist"
+            ls -la /dev/ttyUSB* || echo "No ttyUSB devices found"
+            exit 1
+          fi
+          echo "Device port ${{ inputs.device_port }} found"
+      
+      # ESP32-S3 Flash
+      - name: Flash ESP32-S3
+        if: inputs.target == 's3'
+        run: |
+          # Create secrets.h
+          cp firmware/esp32_s3_pio/include/secrets.h.template \
+             firmware/esp32_s3_pio/include/secrets.h
+          
+          # Determine environment
+          ENV_NAME="s3dev"
+          if [[ "${{ inputs.environment }}" == "release" ]]; then
+            ENV_NAME="s3release"
+          fi
+          
+          # Flash
+          chmod +x tools/flash_esp32_pio.sh
+          ./tools/flash_esp32_pio.sh \
+            --project firmware/esp32_s3_pio \
+            --env $ENV_NAME \
+            --port ${{ inputs.device_port }} \
+            --log-dir logs/release
+      
+      # CYD Flash
+      - name: Flash CYD
+        if: inputs.target == 'cyd'
+        run: |
+          # Create secrets.h
+          cp firmware/cyd_pio/include/secrets.h.template \
+             firmware/cyd_pio/include/secrets.h
+          
+          # Determine environment
+          ENV_NAME="cyd"
+          if [[ "${{ inputs.environment }}" == "release" ]]; then
+            ENV_NAME="cyd_release"
+          fi
+          
+          # Flash
+          chmod +x tools/flash_esp32_pio.sh
+          ./tools/flash_esp32_pio.sh \
+            --project firmware/cyd_pio \
+            --env $ENV_NAME \
+            --port ${{ inputs.device_port }} \
+            --log-dir logs/release
+      
+      # ESP32-P4 Flash
+      - name: Flash ESP32-P4
+        if: inputs.target == 'p4'
+        run: |
+          echo "ESP32-P4 support not yet implemented"
+          exit 1
+          
+          # Uncomment when P4 is available:
+          # source $IDF_PATH/export.sh
+          # chmod +x tools/flash_esp32_idf.sh
+          # ./tools/flash_esp32_idf.sh \
+          #   --project firmware/esp32_p4_idf \
+          #   --port ${{ inputs.device_port }} \
+          #   --log-dir logs/release
+      
+      - name: Wait for device boot
+        run: sleep 5
+      
+      # Post-flash validation
+      - name: Validate serial output
+        if: inputs.run_validation
+        run: |
+          python tools/serial_watch.py \
+            --port ${{ inputs.device_port }} \
+            --timeout 30 \
+            --expect '"selftest":"pass"' \
+            --log-dir logs/release
+      
+      - name: Validate MQTT status
+        if: inputs.run_validation
+        run: |
+          python tools/mqtt_check.py \
+            --broker ${{ env.MQTT_BROKER }} \
+            --port ${{ env.MQTT_PORT }} \
+            --topic "lab/+/status" \
+            --timeout 15 \
+            --expect '"selftest":"pass"' \
+            --log-dir logs/release
+      
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-flash-logs-${{ inputs.target }}
+          path: logs/release/
+          retention-days: 30
+      
+      - name: Summary
+        run: |
+          echo "## Flash Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Target | ${{ inputs.target }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Port | ${{ inputs.device_port }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY

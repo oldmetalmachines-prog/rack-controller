@@ -1,0 +1,38 @@
+# ESP32-P4 SDK Configuration Defaults
+#
+# PLACEHOLDER - Actual configuration pending hardware availability
+#
+# Copy this to sdkconfig.defaults and customize as needed.
+# Secrets should be provided via environment or menuconfig.
+
+# Target selection (update when P4 is supported)
+# CONFIG_IDF_TARGET="esp32p4"
+
+# Serial/UART configuration
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# Wi-Fi Configuration (placeholders - override at build time)
+# CONFIG_WIFI_SSID="your-ssid-here"
+# CONFIG_WIFI_PASSWORD="your-password-here"
+
+# MQTT Configuration (placeholders)
+# CONFIG_MQTT_BROKER_URI="mqtt://homelab.local:1883"
+# CONFIG_MQTT_USERNAME=""
+# CONFIG_MQTT_PASSWORD=""
+
+# Logging
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# FreeRTOS
+CONFIG_FREERTOS_HZ=1000
+
+# Watchdog
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# Partition table
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
+
+# Optimization
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y

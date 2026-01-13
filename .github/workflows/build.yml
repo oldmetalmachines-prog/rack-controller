@@ -1,0 +1,123 @@
+# Build Workflow
+# Builds all firmware targets on self-hosted runner
+#
+# Triggers: PR and push to main
+# Runner: ZimaBlade #1 (build runner)
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pio_build_s3:
+    name: Build ESP32-S3 (PlatformIO)
+    runs-on: [self-hosted, linux, x64, build]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+      
+      - name: Create secrets.h from template
+        run: |
+          cp firmware/esp32_s3_pio/include/secrets.h.template \
+             firmware/esp32_s3_pio/include/secrets.h
+      
+      - name: Build ESP32-S3 firmware
+        run: |
+          pio run -d firmware/esp32_s3_pio -e s3dev
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-s3-firmware
+          path: |
+            firmware/esp32_s3_pio/.pio/build/s3dev/firmware.bin
+            firmware/esp32_s3_pio/.pio/build/s3dev/firmware.elf
+          retention-days: 30
+
+  pio_build_cyd:
+    name: Build CYD (PlatformIO)
+    runs-on: [self-hosted, linux, x64, build]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+      
+      - name: Create secrets.h from template
+        run: |
+          cp firmware/cyd_pio/include/secrets.h.template \
+             firmware/cyd_pio/include/secrets.h
+      
+      - name: Build CYD firmware
+        run: |
+          pio run -d firmware/cyd_pio -e cyd
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyd-firmware
+          path: |
+            firmware/cyd_pio/.pio/build/cyd/firmware.bin
+            firmware/cyd_pio/.pio/build/cyd/firmware.elf
+          retention-days: 30
+
+  idf_build_p4:
+    name: Build ESP32-P4 (ESP-IDF)
+    runs-on: [self-hosted, linux, x64, build]
+    # Skip until P4 hardware is available
+    if: false
+    
+    # Alternative: use Espressif's Docker container
+    # container:
+    #   image: espressif/idf:v5.3
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up ESP-IDF
+        run: |
+          # Assumes ESP-IDF is pre-installed on runner
+          # Or use: git clone --recursive https://github.com/espressif/esp-idf.git
+          # Then: ./esp-idf/install.sh esp32p4
+          source $IDF_PATH/export.sh
+      
+      - name: Build ESP32-P4 firmware
+        run: |
+          source $IDF_PATH/export.sh
+          cd firmware/esp32_p4_idf
+          idf.py set-target esp32p4
+          idf.py build
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-p4-firmware
+          path: |
+            firmware/esp32_p4_idf/build/*.bin
+            firmware/esp32_p4_idf/build/*.elf
+          retention-days: 30
