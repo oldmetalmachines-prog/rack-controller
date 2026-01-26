@@ -1,13 +1,16 @@
-# Auto-create GitHub Issue on HIL Failure
-# Creates structured issues for AI-assisted debugging
+# Auto-create GitHub Issues on Workflow Failures
+# Triggers when Build or HIL workflows fail
 #
-# Triggers: When HIL workflow completes with failure
+# Creates detailed issues with:
+# - Failure context (workflow, job, commit)
+# - Links to failed run
+# - Automatic labels
 
 name: Create Issue on Failure
 
 on:
   workflow_run:
-    workflows: ["HIL Tests"]
+    workflows: ["Build", "HIL Tests"]
     types:
       - completed
 
@@ -16,76 +19,159 @@ jobs:
     name: Create Failure Issue
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'failure' }}
-
+    
     permissions:
       issues: write
       actions: read
-
+    
     steps:
-      - name: Create issue with failed job details
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Get workflow run details
+        id: workflow_info
         uses: actions/github-script@v7
         with:
           script: |
             const run = context.payload.workflow_run;
-
-            const jobsResp = await github.rest.actions.listJobsForWorkflowRun({
+            
+            // Get the failed jobs
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
               owner: context.repo.owner,
               repo: context.repo.repo,
               run_id: run.id
             });
-
-            const failedJobs = jobsResp.data.jobs
-              .filter(job => job.conclusion === 'failure')
-              .map(job => job.name);
-
-            const failedJobsList = failedJobs.length
-              ? failedJobs.map(j => `- ${j}`).join('\n')
-              : '- Unknown (check workflow run)';
-
-            const issueBody = `
-            ## HIL Test Failure Report
-
-            A Hardware-in-the-Loop test has failed and requires investigation.
-
-            ### Failure Details
-
-            | Field | Value |
-            |-------|-------|
-            | **Workflow Run** | [#${run.id}](${run.html_url}) |
-            | **Commit** | \`${run.head_sha}\` |
-            | **Branch** | \`${run.head_branch}\` |
-            | **Triggered by** | @${run.actor?.login || 'unknown'} |
-            | **Event** | \`${run.event}\` |
-
-            ### Failed Jobs
-
-            ${failedJobsList}
-
-            ### Logs
-
-            Check the workflow run for logs and artifacts:
-            ${run.html_url}
-
-            ---
-
-            ### Instructions for AI Fix
-
-            1. Open the workflow run and download any uploaded artifacts (logs/*).
-            2. Classify the failure:
-               - Build failure: compiler/toolchain errors
-               - Flash failure: device port/permissions/USB stability
-               - Serial contract failure: JSON not printed or mismatched
-               - MQTT failure: broker/DNS/network
-            3. Implement the minimal fix and open a PR that references this issue.
-            4. Confirm HIL is green on the PR.
-            `;
-
-            await github.rest.issues.create({
+            
+            const failedJobs = jobs.data.jobs.filter(job => job.conclusion === 'failure');
+            
+            return {
+              workflow_name: run.name,
+              run_id: run.id,
+              run_number: run.run_number,
+              run_url: run.html_url,
+              sha: run.head_sha,
+              sha_short: run.head_sha.substring(0, 7),
+              branch: run.head_branch,
+              triggering_actor: run.triggering_actor.login,
+              failed_jobs: failedJobs.map(job => ({
+                name: job.name,
+                conclusion: job.conclusion,
+                url: job.html_url
+              }))
+            };
+      
+      - name: Check for existing issue
+        id: check_issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const info = ${{ steps.workflow_info.outputs.result }};
+            const issueTitle = `[CI Failure] ${info.workflow_name} failed on ${info.branch}`;
+            
+            // Search for existing open issues with the same title
+            const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `[CI] HIL Test Failure - ${run.head_sha.substring(0, 7)}`,
-              body: issueBody,
-              labels: ['ci-failure', 'ai-fix-needed']
+              state: 'open',
+              labels: 'ci-failure',
+              per_page: 100
             });
-
-            console.log('Issue created successfully');
+            
+            const existingIssue = issues.data.find(issue => 
+              issue.title.includes(info.workflow_name) && 
+              issue.title.includes(info.branch)
+            );
+            
+            if (existingIssue) {
+              console.log(`Found existing issue: #${existingIssue.number}`);
+              return { exists: true, number: existingIssue.number };
+            }
+            
+            return { exists: false };
+      
+      - name: Create or update issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const info = ${{ steps.workflow_info.outputs.result }};
+            const checkResult = ${{ steps.check_issue.outputs.result }};
+            
+            // Build failed jobs list
+            let jobsList = '';
+            for (const job of info.failed_jobs) {
+              jobsList += `- [${job.name}](${job.url}) - ${job.conclusion}\n`;
+            }
+            
+            const issueBody = `## CI Failure Report
+            
+            **Workflow**: ${info.workflow_name}  
+            **Branch**: \`${info.branch}\`  
+            **Commit**: \`${info.sha_short}\` ([view](https://github.com/${context.repo.owner}/${context.repo.repo}/commit/${info.sha}))  
+            **Triggered by**: @${info.triggering_actor}  
+            **Run**: [#${info.run_number}](${info.run_url})
+            
+            ### Failed Jobs
+            
+            ${jobsList || 'No specific job failures detected'}
+            
+            ### Possible Causes
+            
+            - [ ] Build environment issue
+            - [ ] Code changes broke compilation
+            - [ ] Test device unavailable or misconfigured
+            - [ ] Network/MQTT connectivity issue
+            - [ ] Dependency version conflict
+            
+            ### Action Required
+            
+            1. Review the [workflow run logs](${info.run_url})
+            2. Check the failed job details above
+            3. Verify device availability (for HIL tests)
+            4. Fix the issue and push a new commit
+            5. Close this issue once resolved
+            
+            ---
+            
+            *This issue was automatically created by the \`issue_on_fail\` workflow.*  
+            *Last failure: ${new Date().toISOString()}*
+            `;
+            
+            if (checkResult.exists) {
+              // Update existing issue
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: checkResult.number,
+                body: `### Additional Failure\n\n${issueBody}`
+              });
+              
+              console.log(`Updated existing issue #${checkResult.number}`);
+            } else {
+              // Create new issue
+              const issue = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[CI Failure] ${info.workflow_name} failed on ${info.branch}`,
+                body: issueBody,
+                labels: [
+                  'ci-failure',
+                  'automated',
+                  info.workflow_name.toLowerCase().includes('hil') ? 'hil-test' : 'build'
+                ]
+              });
+              
+              console.log(`Created new issue #${issue.data.number}`);
+            }
+      
+      - name: Notify summary
+        run: |
+          INFO='${{ steps.workflow_info.outputs.result }}'
+          WORKFLOW_NAME=$(echo "$INFO" | jq -r '.workflow_name')
+          RUN_URL=$(echo "$INFO" | jq -r '.run_url')
+          
+          echo "## Issue Creation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Workflow**: $WORKFLOW_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "- **Run**: [View logs]($RUN_URL)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "An issue has been created or updated to track this failure." >> $GITHUB_STEP_SUMMARY
