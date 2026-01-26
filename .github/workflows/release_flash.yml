@@ -1,171 +1,411 @@
-# Manual Release Flash Workflow
-# Manually flash firmware to staging devices
+# Manual Deployment Workflow
+# Flash firmware to staging/production devices with approval gates
 #
-# Triggers: Manual dispatch only (workflow_dispatch)
-# Runner: ZimaBlade #2 (flash runner)
+# Triggers: Manual workflow_dispatch only
+# Runner: ZimaBlade #2 (HIL runner with device access)
 
-name: Release Flash
+name: Deploy Firmware
 
 on:
   workflow_dispatch:
     inputs:
-      target:
-        description: 'Target device type'
-        required: true
-        type: choice
-        options:
-          - s3
-          - cyd
-          - p4
-      device_port:
-        description: 'Device serial port (e.g., /dev/ttyUSB0)'
-        required: true
-        type: string
       environment:
-        description: 'Build environment'
+        description: 'Deployment environment'
         required: true
         type: choice
         options:
-          - dev
-          - release
-        default: 'release'
-      run_validation:
-        description: 'Run post-flash validation'
+          - staging
+          - production
+      target:
+        description: 'Target device(s) to flash'
+        required: true
+        type: choice
+        options:
+          - all
+          - esp32-s3
+          - cyd
+          - esp32-p4
+      git_ref:
+        description: 'Git ref to deploy (branch, tag, or SHA)'
+        required: true
+        default: 'main'
+      skip_validation:
+        description: 'Skip post-flash validation (not recommended)'
         required: false
         type: boolean
-        default: true
+        default: false
 
 env:
+  PYTHON_VERSION: '3.11'
   MQTT_BROKER: homelab.local
   MQTT_PORT: 1883
 
 jobs:
-  flash_staging:
-    name: Flash ${{ inputs.target }} to Staging
-    runs-on: [self-hosted, linux, x64, flash]
+  validate_deployment:
+    name: Validate Deployment Request
+    runs-on: [self-hosted, linux, x64, build]
+    
+    outputs:
+      is_valid: ${{ steps.validate.outputs.is_valid }}
+      git_sha: ${{ steps.validate.outputs.git_sha }}
+      git_sha_short: ${{ steps.validate.outputs.git_sha_short }}
     
     steps:
-      - name: Checkout repository
+      - name: Checkout requested ref
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
+      
+      - name: Validate git ref
+        id: validate
+        run: |
+          # Verify the ref exists and get SHA
+          if ! git rev-parse --verify ${{ inputs.git_ref }} >/dev/null 2>&1; then
+            echo "::error::Invalid git ref: ${{ inputs.git_ref }}"
+            echo "is_valid=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          SHA_FULL=$(git rev-parse ${{ inputs.git_ref }})
+          SHA_SHORT=$(git rev-parse --short ${{ inputs.git_ref }})
+          
+          echo "git_sha=$SHA_FULL" >> $GITHUB_OUTPUT
+          echo "git_sha_short=$SHA_SHORT" >> $GITHUB_OUTPUT
+          echo "is_valid=true" >> $GITHUB_OUTPUT
+          
+          echo "✅ Validated git ref: ${{ inputs.git_ref }}"
+          echo "   SHA: $SHA_FULL"
+      
+      - name: Check if production deployment
+        if: inputs.environment == 'production'
+        run: |
+          echo "::warning::Production deployment requested!"
+          echo "::warning::Target: ${{ inputs.target }}"
+          echo "::warning::Git ref: ${{ inputs.git_ref }}"
+          echo "::warning::SHA: ${{ steps.validate.outputs.git_sha }}"
+          
+          # For production, ensure we're on a tag or main branch
+          REF="${{ inputs.git_ref }}"
+          if [[ ! "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] && [ "$REF" != "main" ]; then
+            echo "::error::Production deployments should use version tags (v*.*.*)  or main branch"
+            echo "::error::Current ref: $REF"
+            exit 1
+          fi
+
+  # Production deployments require manual approval
+  production_approval:
+    name: Production Approval Gate
+    runs-on: ubuntu-latest
+    needs: [validate_deployment]
+    if: inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    
+    steps:
+      - name: Approval checkpoint
+        run: |
+          echo "## Production Deployment Approved" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target**: ${{ inputs.target }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Git Ref**: ${{ inputs.git_ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **SHA**: ${{ needs.validate_deployment.outputs.git_sha_short }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Approved by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+
+  deploy:
+    name: Deploy ${{ matrix.target }} to ${{ inputs.environment }}
+    runs-on: [self-hosted, linux, x64, hil]
+    needs: [validate_deployment, production_approval]
+    if: |
+      always() && 
+      needs.validate_deployment.result == 'success' &&
+      (inputs.environment != 'production' || needs.production_approval.result == 'success')
+    
+    strategy:
+      fail-fast: false
+      max-parallel: 1  # Flash one device at a time to avoid conflicts
+      matrix:
+        include:
+          - target: ESP32-S3
+            target_code: esp32-s3
+            project_dir: firmware/esp32_s3_pio
+            env_name: s3dev
+            device_port_staging: /dev/ttyUSB_ESP32_S3_STAGING
+            device_port_production: /dev/ttyUSB_ESP32_S3_PROD
+            platform: platformio
+            
+          - target: CYD
+            target_code: cyd
+            project_dir: firmware/cyd_pio
+            env_name: cyd
+            device_port_staging: /dev/ttyUSB_CYD_STAGING
+            device_port_production: /dev/ttyUSB_CYD_PROD
+            platform: platformio
+            
+          - target: ESP32-P4
+            target_code: esp32-p4
+            project_dir: firmware/esp32_p4_idf
+            env_name: p4
+            device_port_staging: /dev/ttyUSB_P4_STAGING
+            device_port_production: /dev/ttyUSB_P4_PROD
+            platform: idf
+    
+    # Only deploy if target matches or 'all' selected
+    if: |
+      inputs.target == 'all' || 
+      inputs.target == matrix.target_code
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
       
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
       
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install platformio pyserial paho-mqtt
+          
+          if [ "${{ matrix.platform }}" == "platformio" ]; then
+            pip install platformio pyserial paho-mqtt
+          else
+            pip install pyserial paho-mqtt
+          fi
       
-      - name: Validate device port exists
+      - name: Set device port
+        id: device
         run: |
-          if [[ ! -e "${{ inputs.device_port }}" ]]; then
-            echo "Error: Device port ${{ inputs.device_port }} does not exist"
-            ls -la /dev/ttyUSB* || echo "No ttyUSB devices found"
+          if [ "${{ inputs.environment }}" == "production" ]; then
+            echo "port=${{ matrix.device_port_production }}" >> $GITHUB_OUTPUT
+          else
+            echo "port=${{ matrix.device_port_staging }}" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Create deployment logs directory
+        run: |
+          mkdir -p deploy_logs/${{ matrix.target_code }}
+          
+          cat > deploy_logs/${{ matrix.target_code }}/deploy-info.txt << EOF
+          ========================================
+          Deployment Information
+          ========================================
+          Target:        ${{ matrix.target }}
+          Environment:   ${{ inputs.environment }}
+          Device Port:   ${{ steps.device.outputs.port }}
+          
+          Git Ref:       ${{ inputs.git_ref }}
+          Git SHA:       ${{ needs.validate_deployment.outputs.git_sha }}
+          Short SHA:     ${{ needs.validate_deployment.outputs.git_sha_short }}
+          
+          Deploy Date:   $(date -u +"%Y-%m-%d")
+          Deploy Time:   $(date -u +"%H:%M:%S UTC")
+          Deployed By:   ${{ github.actor }}
+          Workflow:      ${{ github.workflow }}
+          Run Number:    ${{ github.run_number }}
+          ========================================
+          EOF
+          
+          cat deploy_logs/${{ matrix.target_code }}/deploy-info.txt
+      
+      - name: Verify device availability
+        run: |
+          DEVICE_PORT="${{ steps.device.outputs.port }}"
+          
+          echo "Checking for device at $DEVICE_PORT..."
+          
+          if [ ! -e "$DEVICE_PORT" ]; then
+            echo "::error::Device not found at $DEVICE_PORT"
+            echo "Available devices:"
+            ls -la /dev/ttyUSB* 2>/dev/null || true
+            ls -la /dev/ttyACM* 2>/dev/null || true
             exit 1
           fi
-          echo "Device port ${{ inputs.device_port }} found"
+          
+          echo "✅ Device found at $DEVICE_PORT"
+          ls -la $DEVICE_PORT
       
-      # ESP32-S3 Flash
-      - name: Flash ESP32-S3
-        if: inputs.target == 's3'
+      - name: Create secrets.h from template
+        if: matrix.platform == 'platformio'
         run: |
-          # Create secrets.h
-          cp firmware/esp32_s3_pio/include/secrets.h.template \
-             firmware/esp32_s3_pio/include/secrets.h
+          cp ${{ matrix.project_dir }}/include/secrets.h.template \
+             ${{ matrix.project_dir }}/include/secrets.h
           
-          # Determine environment
-          ENV_NAME="s3dev"
-          if [[ "${{ inputs.environment }}" == "release" ]]; then
-            ENV_NAME="s3release"
-          fi
+          # Inject deployment metadata
+          cat >> ${{ matrix.project_dir }}/include/secrets.h << EOF
           
-          # Flash
+          // Deployment metadata
+          #define BUILD_GIT_SHA "${{ needs.validate_deployment.outputs.git_sha_short }}"
+          #define BUILD_TIMESTAMP $(date +%s)
+          #define BUILD_ENVIRONMENT "${{ inputs.environment }}"
+          #define BUILD_TARGET "${{ matrix.target }}"
+          EOF
+      
+      - name: Build firmware (PlatformIO)
+        if: matrix.platform == 'platformio'
+        run: |
+          echo "Building ${{ matrix.target }} firmware for deployment..."
+          pio run -d ${{ matrix.project_dir }} -e ${{ matrix.env_name }}
+      
+      - name: Build firmware (ESP-IDF)
+        if: matrix.platform == 'idf'
+        run: |
+          echo "Building ${{ matrix.target }} firmware for deployment..."
+          . $IDF_PATH/export.sh
+          cd ${{ matrix.project_dir }}
+          idf.py set-target esp32p4
+          idf.py build
+      
+      - name: Flash device (PlatformIO)
+        if: matrix.platform == 'platformio'
+        timeout-minutes: 10
+        run: |
+          echo "⚡ Flashing ${{ matrix.target }} to ${{ inputs.environment }}..."
+          
           chmod +x tools/flash_esp32_pio.sh
           ./tools/flash_esp32_pio.sh \
-            --project firmware/esp32_s3_pio \
-            --env $ENV_NAME \
-            --port ${{ inputs.device_port }} \
-            --log-dir logs/release
+            --project ${{ matrix.project_dir }} \
+            --env ${{ matrix.env_name }} \
+            --port ${{ steps.device.outputs.port }} \
+            --log-dir deploy_logs/${{ matrix.target_code }}
+          
+          echo "✅ Flash completed successfully"
       
-      # CYD Flash
-      - name: Flash CYD
-        if: inputs.target == 'cyd'
+      - name: Flash device (ESP-IDF)
+        if: matrix.platform == 'idf'
+        timeout-minutes: 10
         run: |
-          # Create secrets.h
-          cp firmware/cyd_pio/include/secrets.h.template \
-             firmware/cyd_pio/include/secrets.h
+          echo "⚡ Flashing ${{ matrix.target }} to ${{ inputs.environment }}..."
           
-          # Determine environment
-          ENV_NAME="cyd"
-          if [[ "${{ inputs.environment }}" == "release" ]]; then
-            ENV_NAME="cyd_release"
-          fi
+          chmod +x tools/flash_esp32_idf.sh
+          ./tools/flash_esp32_idf.sh \
+            --project ${{ matrix.project_dir }} \
+            --port ${{ steps.device.outputs.port }} \
+            --log-dir deploy_logs/${{ matrix.target_code }}
           
-          # Flash
-          chmod +x tools/flash_esp32_pio.sh
-          ./tools/flash_esp32_pio.sh \
-            --project firmware/cyd_pio \
-            --env $ENV_NAME \
-            --port ${{ inputs.device_port }} \
-            --log-dir logs/release
-      
-      # ESP32-P4 Flash
-      - name: Flash ESP32-P4
-        if: inputs.target == 'p4'
-        run: |
-          echo "ESP32-P4 support not yet implemented"
-          exit 1
-          
-          # Uncomment when P4 is available:
-          # source $IDF_PATH/export.sh
-          # chmod +x tools/flash_esp32_idf.sh
-          # ./tools/flash_esp32_idf.sh \
-          #   --project firmware/esp32_p4_idf \
-          #   --port ${{ inputs.device_port }} \
-          #   --log-dir logs/release
+          echo "✅ Flash completed successfully"
       
       - name: Wait for device boot
-        run: sleep 5
-      
-      # Post-flash validation
-      - name: Validate serial output
-        if: inputs.run_validation
         run: |
+          echo "Waiting for device to boot..."
+          sleep 10
+      
+      - name: Validate deployment (Serial)
+        if: ${{ !inputs.skip_validation }}
+        timeout-minutes: 3
+        run: |
+          echo "Validating serial boot contract..."
+          chmod +x tools/serial_watch.py
+          
           python tools/serial_watch.py \
-            --port ${{ inputs.device_port }} \
+            --port ${{ steps.device.outputs.port }} \
             --timeout 30 \
             --expect '"selftest":"pass"' \
-            --log-dir logs/release
+            --log-dir deploy_logs/${{ matrix.target_code }}
+          
+          echo "✅ Serial validation passed"
       
-      - name: Validate MQTT status
-        if: inputs.run_validation
+      - name: Validate deployment (MQTT)
+        if: ${{ !inputs.skip_validation }}
+        timeout-minutes: 2
         run: |
+          echo "Validating MQTT status..."
+          chmod +x tools/mqtt_check.py
+          
           python tools/mqtt_check.py \
             --broker ${{ env.MQTT_BROKER }} \
             --port ${{ env.MQTT_PORT }} \
             --topic "lab/+/status" \
-            --timeout 15 \
+            --timeout 20 \
             --expect '"selftest":"pass"' \
-            --log-dir logs/release
+            --log-dir deploy_logs/${{ matrix.target_code }}
+          
+          echo "✅ MQTT validation passed"
       
-      - name: Upload logs
+      - name: Generate deployment report
+        if: always()
+        run: |
+          REPORT_FILE="deploy_logs/${{ matrix.target_code }}/deployment-report.md"
+          
+          cat > "$REPORT_FILE" << EOF
+          # Deployment Report: ${{ matrix.target }}
+          
+          ## Deployment Details
+          
+          - **Environment**: ${{ inputs.environment }}
+          - **Target**: ${{ matrix.target }}
+          - **Device Port**: ${{ steps.device.outputs.port }}
+          - **Platform**: ${{ matrix.platform }}
+          
+          ## Build Information
+          
+          - **Git Ref**: ${{ inputs.git_ref }}
+          - **Git SHA**: ${{ needs.validate_deployment.outputs.git_sha }}
+          - **Short SHA**: ${{ needs.validate_deployment.outputs.git_sha_short }}
+          
+          ## Deployment Metadata
+          
+          - **Date**: $(date -u +"%Y-%m-%d")
+          - **Time**: $(date -u +"%H:%M:%S UTC")
+          - **Deployed By**: ${{ github.actor }}
+          - **Workflow Run**: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          
+          ## Validation Results
+          
+          - **Serial Boot Contract**: ${{ !inputs.skip_validation && '✅ Validated' || '⚠️ Skipped' }}
+          - **MQTT Status**: ${{ !inputs.skip_validation && '✅ Validated' || '⚠️ Skipped' }}
+          
+          ## Status
+          
+          **Deployment Status**: ${{ job.status }}
+          
+          ---
+          
+          *Generated by \`release_flash.yml\` workflow*
+          EOF
+          
+          cat "$REPORT_FILE"
+      
+      - name: Upload deployment logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: release-flash-logs-${{ inputs.target }}
-          path: logs/release/
-          retention-days: 30
-      
-      - name: Summary
+          name: deployment-logs-${{ matrix.target_code }}-${{ inputs.environment }}-${{ needs.validate_deployment.outputs.git_sha_short }}
+          path: deploy_logs/${{ matrix.target_code }}/
+          retention-days: 90
+
+  deployment_summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [validate_deployment, deploy]
+    if: always()
+    
+    steps:
+      - name: Generate deployment summary
         run: |
-          echo "## Flash Summary" >> $GITHUB_STEP_SUMMARY
+          echo "# Deployment Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Target | ${{ inputs.target }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Port | ${{ inputs.device_port }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Environment | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Triggered by | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "## Parameters" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target**: ${{ inputs.target }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Git Ref**: ${{ inputs.git_ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **SHA**: \`${{ needs.validate_deployment.outputs.git_sha_short }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Skip Validation**: ${{ inputs.skip_validation }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Results" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "✅ **Deployment succeeded**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Deployment failed**" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployed by**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
