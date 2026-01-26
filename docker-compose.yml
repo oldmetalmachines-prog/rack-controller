@@ -1,18 +1,179 @@
+# Docker Compose for GitHub Actions Self-Hosted Runners
+# Supports both build and HIL (Hardware-in-the-Loop) runners
+#
+# Setup:
+# 1. Copy .env.example to .env
+# 2. Add your RUNNER_TOKEN from GitHub
+# 3. Run: docker-compose up -d
+
+version: '3.8'
+
 services:
-  gha-runner:
+  # Build Runner - For compiling firmware
+  # Runs on ZimaBlade #1 or any build server
+  build-runner:
     build:
       context: .
       dockerfile: docker/runner/Dockerfile
-    container_name: gha-runner
+      args:
+        RUNNER_VERSION: 2.311.0
+    container_name: build-runner
+    hostname: build-runner
     restart: unless-stopped
+    
     environment:
-      GITHUB_OWNER: "oldmetalmachines-prog"
-      GITHUB_REPO: "rack-controller"
-      RUNNER_TOKEN: "${RUNNER_TOKEN}"
-      RUNNER_NAME: "g3-runner-01"
-      RUNNER_LABELS: "g3,linux,x86_64,usb-flash"
-    privileged: true
+      # GitHub Configuration
+      GITHUB_OWNER: ${GITHUB_OWNER:-oldmetalmachines-prog}
+      GITHUB_REPO: ${GITHUB_REPO:-rack-controller}
+      RUNNER_TOKEN: ${BUILD_RUNNER_TOKEN}
+      RUNNER_NAME: ${BUILD_RUNNER_NAME:-zimablade-1-build}
+      RUNNER_LABELS: "self-hosted,linux,x64,build"
+      RUNNER_WORKDIR: /home/runner/actions-runner/_work
+      
+      # Build tools configuration
+      PLATFORMIO_CORE_DIR: /home/runner/.platformio
+      
     volumes:
+      # Docker socket for container builds (if needed)
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./_runner_work:/home/runner/actions-runner/_work
+      
+      # Persistent work directory
+      - ./runner_data/build_work:/home/runner/actions-runner/_work
+      
+      # Cache directories for faster builds
+      - ./runner_data/platformio_cache:/home/runner/.platformio
+      - ./runner_data/pip_cache:/home/runner/.cache/pip
+    
+    networks:
+      - runner-network
+    
+    # Resource limits (adjust based on your hardware)
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "Runner.Listener"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # HIL Runner - For flashing and testing real hardware
+  # Runs on ZimaBlade #2 or server with USB device access
+  hil-runner:
+    build:
+      context: .
+      dockerfile: docker/runner/Dockerfile
+      args:
+        RUNNER_VERSION: 2.311.0
+    container_name: hil-runner
+    hostname: hil-runner
+    restart: unless-stopped
+    
+    # Privileged mode required for USB device access
+    privileged: true
+    
+    environment:
+      # GitHub Configuration
+      GITHUB_OWNER: ${GITHUB_OWNER:-oldmetalmachines-prog}
+      GITHUB_REPO: ${GITHUB_REPO:-rack-controller}
+      RUNNER_TOKEN: ${HIL_RUNNER_TOKEN}
+      RUNNER_NAME: ${HIL_RUNNER_NAME:-zimablade-2-hil}
+      RUNNER_LABELS: "self-hosted,linux,x64,hil"
+      RUNNER_WORKDIR: /home/runner/actions-runner/_work
+      
+      # MQTT configuration for HIL tests
+      MQTT_BROKER: ${MQTT_BROKER:-homelab.local}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      
+    volumes:
+      # USB device access
       - /dev:/dev
+      
+      # Persistent work directory
+      - ./runner_data/hil_work:/home/runner/actions-runner/_work
+      
+      # Cache directories
+      - ./runner_data/platformio_cache_hil:/home/runner/.platformio
+      - ./runner_data/pip_cache_hil:/home/runner/.cache/pip
+      
+      # Optional: udev rules for consistent device naming
+      # - ./config/99-esp32-rack.rules:/etc/udev/rules.d/99-esp32-rack.rules:ro
+    
+    networks:
+      - runner-network
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "Runner.Listener"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Optional: MQTT Broker for local testing
+  # Comment out if using external broker
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: mqtt-broker
+    restart: unless-stopped
+    
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    
+    volumes:
+      - ./runner_data/mosquitto/config:/mosquitto/config
+      - ./runner_data/mosquitto/data:/mosquitto/data
+      - ./runner_data/mosquitto/log:/mosquitto/log
+    
+    networks:
+      - runner-network
+    
+    # Create default config if not exists
+    command: >
+      sh -c "
+        mkdir -p /mosquitto/config /mosquitto/data /mosquitto/log &&
+        if [ ! -f /mosquitto/config/mosquitto.conf ]; then
+          echo 'listener 1883' > /mosquitto/config/mosquitto.conf;
+          echo 'allow_anonymous true' >> /mosquitto/config/mosquitto.conf;
+          echo 'persistence true' >> /mosquitto/config/mosquitto.conf;
+          echo 'persistence_location /mosquitto/data/' >> /mosquitto/config/mosquitto.conf;
+          echo 'log_dest file /mosquitto/log/mosquitto.log' >> /mosquitto/config/mosquitto.conf;
+        fi &&
+        /usr/sbin/mosquitto -c /mosquitto/config/mosquitto.conf
+      "
+
+networks:
+  runner-network:
+    driver: bridge
+
+# Volume definitions (alternative to bind mounts)
+# Uncomment to use named volumes instead of ./runner_data
+# volumes:
+#   build_work:
+#   hil_work:
+#   platformio_cache:
+#   platformio_cache_hil:
+#   pip_cache:
+#   pip_cache_hil:
+#   mosquitto_config:
+#   mosquitto_data:
+#   mosquitto_log:
