@@ -12,103 +12,135 @@ on:
   pull_request:
     branches: [main]
 
-jobs:
-  pio_build_s3:
-    name: Build ESP32-S3 (PlatformIO)
-    runs-on: [self-hosted, linux, x64, build]
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      
-      - name: Install PlatformIO
-        run: |
-          python -m pip install --upgrade pip
-          pip install platformio
-      
-      - name: Create secrets.h from template
-        run: |
-          cp firmware/esp32_s3_pio/include/secrets.h.template \
-             firmware/esp32_s3_pio/include/secrets.h
-      
-      - name: Build ESP32-S3 firmware
-        run: |
-          pio run -d firmware/esp32_s3_pio -e s3dev
-      
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: esp32-s3-firmware
-          path: |
-            firmware/esp32_s3_pio/.pio/build/s3dev/firmware.bin
-            firmware/esp32_s3_pio/.pio/build/s3dev/firmware.elf
-          retention-days: 30
+env:
+  PYTHON_VERSION: '3.11'
+  PIO_VERSION: '6.1.15'
 
-  pio_build_cyd:
-    name: Build CYD (PlatformIO)
+jobs:
+  pio_build:
+    name: Build ${{ matrix.target }} (PlatformIO)
     runs-on: [self-hosted, linux, x64, build]
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: ESP32-S3
+            project_dir: firmware/esp32_s3_pio
+            env_name: s3dev
+            artifact_name: esp32-s3-firmware
+          - target: CYD
+            project_dir: firmware/cyd_pio
+            env_name: cyd
+            artifact_name: cyd-firmware
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for git describe
       
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ${{ matrix.project_dir }}/.pio
+          key: ${{ runner.os }}-pio-${{ matrix.target }}-${{ hashFiles('**/platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-${{ matrix.target }}-
+            ${{ runner.os }}-pio-
       
       - name: Install PlatformIO
         run: |
           python -m pip install --upgrade pip
-          pip install platformio
+          pip install platformio==${{ env.PIO_VERSION }}
+      
+      - name: Get Git commit info
+        id: git_info
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "sha_full=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "branch=${GITHUB_REF#refs/heads/}" >> $GITHUB_OUTPUT
       
       - name: Create secrets.h from template
         run: |
-          cp firmware/cyd_pio/include/secrets.h.template \
-             firmware/cyd_pio/include/secrets.h
+          cp ${{ matrix.project_dir }}/include/secrets.h.template \
+             ${{ matrix.project_dir }}/include/secrets.h
+          
+          # Optional: Inject build metadata
+          echo "" >> ${{ matrix.project_dir }}/include/secrets.h
+          echo "#define BUILD_GIT_SHA \"${{ steps.git_info.outputs.sha_short }}\"" >> ${{ matrix.project_dir }}/include/secrets.h
+          echo "#define BUILD_TIMESTAMP $(date +%s)" >> ${{ matrix.project_dir }}/include/secrets.h
       
-      - name: Build CYD firmware
+      - name: Build firmware
         run: |
-          pio run -d firmware/cyd_pio -e cyd
+          pio run -d ${{ matrix.project_dir }} -e ${{ matrix.env_name }}
+      
+      - name: Generate build info
+        run: |
+          cat > build-info.txt << EOF
+          Target: ${{ matrix.target }}
+          Environment: ${{ matrix.env_name }}
+          Git SHA: ${{ steps.git_info.outputs.sha_full }}
+          Git Short SHA: ${{ steps.git_info.outputs.sha_short }}
+          Branch: ${{ steps.git_info.outputs.branch }}
+          Build Time: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Workflow: ${{ github.workflow }}
+          Run Number: ${{ github.run_number }}
+          EOF
+          
+          # Move to build directory for artifact upload
+          cp build-info.txt ${{ matrix.project_dir }}/.pio/build/${{ matrix.env_name }}/
       
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: cyd-firmware
+          name: ${{ matrix.artifact_name }}-${{ steps.git_info.outputs.sha_short }}
           path: |
-            firmware/cyd_pio/.pio/build/cyd/firmware.bin
-            firmware/cyd_pio/.pio/build/cyd/firmware.elf
+            ${{ matrix.project_dir }}/.pio/build/${{ matrix.env_name }}/firmware.bin
+            ${{ matrix.project_dir }}/.pio/build/${{ matrix.env_name }}/firmware.elf
+            ${{ matrix.project_dir }}/.pio/build/${{ matrix.env_name }}/build-info.txt
           retention-days: 30
+          if-no-files-found: error
+      
+      - name: Display build size
+        run: |
+          ls -lh ${{ matrix.project_dir }}/.pio/build/${{ matrix.env_name }}/firmware.bin
+          if [ -f "${{ matrix.project_dir }}/.pio/build/${{ matrix.env_name }}/firmware.elf" ]; then
+            pio device monitor --echo --filter=esp32_exception_decoder \
+              -d ${{ matrix.project_dir }} -e ${{ matrix.env_name }} --no-reconnect || true
+          fi
 
   idf_build_p4:
     name: Build ESP32-P4 (ESP-IDF)
     runs-on: [self-hosted, linux, x64, build]
-    # Skip until P4 hardware is available
-    if: false
+    if: false  # Skip until P4 hardware is available
     
-    # Alternative: use Espressif's Docker container
-    # container:
-    #   image: espressif/idf:v5.3
+    container:
+      image: espressif/idf:v5.3
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       
-      - name: Set up ESP-IDF
+      - name: Get Git commit info
+        id: git_info
         run: |
-          # Assumes ESP-IDF is pre-installed on runner
-          # Or use: git clone --recursive https://github.com/espressif/esp-idf.git
-          # Then: ./esp-idf/install.sh esp32p4
-          source $IDF_PATH/export.sh
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "sha_full=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
       
       - name: Build ESP32-P4 firmware
         run: |
-          source $IDF_PATH/export.sh
+          . $IDF_PATH/export.sh
           cd firmware/esp32_p4_idf
           idf.py set-target esp32p4
           idf.py build
@@ -116,8 +148,23 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: esp32-p4-firmware
+          name: esp32-p4-firmware-${{ steps.git_info.outputs.sha_short }}
           path: |
             firmware/esp32_p4_idf/build/*.bin
             firmware/esp32_p4_idf/build/*.elf
           retention-days: 30
+
+  build_summary:
+    name: Build Summary
+    runs-on: [self-hosted, linux, x64, build]
+    needs: [pio_build]
+    if: always()
+    
+    steps:
+      - name: Check build status
+        run: |
+          if [ "${{ needs.pio_build.result }}" != "success" ]; then
+            echo "::error::One or more builds failed"
+            exit 1
+          fi
+          echo "✅ All builds completed successfully"
