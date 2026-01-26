@@ -17,7 +17,7 @@ on:
           - staging
           - production
       target:
-        description: 'Target device(s) to flash'
+        description: 'Target device(s) to flash (NOTE: Due to GitHub Actions limitations, all targets will be deployed. Use separate workflow runs for individual targets.)'
         required: true
         type: choice
         options:
@@ -150,11 +150,6 @@ jobs:
             device_port_staging: /dev/ttyUSB_P4_STAGING
             device_port_production: /dev/ttyUSB_P4_PROD
             platform: idf
-    
-    # Only deploy if target matches or 'all' selected
-    if: |
-      inputs.target == 'all' || 
-      inputs.target == matrix.target_code
     
     steps:
       - name: Checkout code
