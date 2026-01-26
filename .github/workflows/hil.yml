@@ -12,7 +12,7 @@ on:
   workflow_dispatch:  # Allow manual HIL testing
     inputs:
       target:
-        description: 'Target to test (s3, cyd, p4, or all)'
+        description: 'Target to test (NOTE: Due to GitHub Actions limitations, all enabled targets will run. This input is for documentation only.)'
         required: true
         default: 'all'
         type: choice
@@ -20,7 +20,6 @@ on:
           - all
           - s3
           - cyd
-          - p4
 
 env:
   PYTHON_VERSION: '3.11'
@@ -34,12 +33,6 @@ jobs:
     name: HIL Test ${{ matrix.target }}
     runs-on: [self-hosted, linux, x64, hil]
     
-    # Skip based on workflow_dispatch input or platform availability
-    if: |
-      (github.event_name == 'pull_request') ||
-      (github.event_name == 'workflow_dispatch' && 
-       (github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target_code))
-    
     strategy:
       fail-fast: false
       matrix:
@@ -48,31 +41,15 @@ jobs:
             target_code: s3
             project_dir: firmware/esp32_s3_pio
             env_name: s3dev
-            port_env: S3_TEST_PORT
             device_port: /dev/ttyUSB_ESP32_S3_TEST
             platform: platformio
-            enabled: true
             
           - target: CYD
             target_code: cyd
             project_dir: firmware/cyd_pio
             env_name: cyd
-            port_env: CYD_TEST_PORT
             device_port: /dev/ttyUSB_CYD_TEST
             platform: platformio
-            enabled: true
-            
-          - target: ESP32-P4
-            target_code: p4
-            project_dir: firmware/esp32_p4_idf
-            env_name: p4
-            port_env: P4_TEST_PORT
-            device_port: /dev/ttyUSB_P4_TEST
-            platform: idf
-            enabled: false  # Not yet available
-    
-    # Skip disabled targets
-    continue-on-error: ${{ !matrix.enabled }}
     
     steps:
       - name: Checkout repository
@@ -87,7 +64,6 @@ jobs:
           cache: 'pip'
       
       - name: Cache PlatformIO
-        if: matrix.platform == 'platformio'
         uses: actions/cache@v4
         with:
           path: |
@@ -100,12 +76,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          
-          if [ "${{ matrix.platform }}" == "platformio" ]; then
-            pip install platformio pyserial paho-mqtt
-          else
-            pip install pyserial paho-mqtt
-          fi
+          pip install platformio pyserial paho-mqtt
       
       - name: Get Git commit info
         id: git_info
@@ -135,17 +106,9 @@ jobs:
           fi
       
       - name: Create secrets.h from template
-        if: matrix.platform == 'platformio'
         run: |
           cp ${{ matrix.project_dir }}/include/secrets.h.template \
              ${{ matrix.project_dir }}/include/secrets.h
-          
-          # Inject test credentials if available
-          # NOTE: Add these as repository secrets for actual testing
-          # if [ -n "${{ secrets.TEST_WIFI_SSID }}" ]; then
-          #   sed -i 's/your-ssid-here/${{ secrets.TEST_WIFI_SSID }}/g' \
-          #     ${{ matrix.project_dir }}/include/secrets.h
-          # fi
           
           # Inject build metadata
           cat >> ${{ matrix.project_dir }}/include/secrets.h << EOF
@@ -156,23 +119,12 @@ jobs:
           #define BUILD_TARGET "${{ matrix.target }}"
           EOF
       
-      - name: Build firmware (PlatformIO)
-        if: matrix.platform == 'platformio'
+      - name: Build firmware
         run: |
           echo "Building ${{ matrix.target }} firmware..."
           pio run -d ${{ matrix.project_dir }} -e ${{ matrix.env_name }}
       
-      - name: Build firmware (ESP-IDF)
-        if: matrix.platform == 'idf'
-        run: |
-          echo "Building ${{ matrix.target }} firmware..."
-          . $IDF_PATH/export.sh
-          cd ${{ matrix.project_dir }}
-          idf.py set-target esp32p4
-          idf.py build
-      
-      - name: Flash device (PlatformIO)
-        if: matrix.platform == 'platformio'
+      - name: Flash device
         timeout-minutes: 5
         run: |
           echo "Flashing ${{ matrix.target }} at ${{ matrix.device_port }}..."
@@ -181,19 +133,6 @@ jobs:
           ./tools/flash_esp32_pio.sh \
             --project ${{ matrix.project_dir }} \
             --env ${{ matrix.env_name }} \
-            --port ${{ matrix.device_port }} \
-            --log-dir logs/${{ matrix.target_code }} \
-            || (echo "::error::Flash failed for ${{ matrix.target }}" && exit 1)
-      
-      - name: Flash device (ESP-IDF)
-        if: matrix.platform == 'idf'
-        timeout-minutes: 5
-        run: |
-          echo "Flashing ${{ matrix.target }} at ${{ matrix.device_port }}..."
-          
-          chmod +x tools/flash_esp32_idf.sh
-          ./tools/flash_esp32_idf.sh \
-            --project ${{ matrix.project_dir }} \
             --port ${{ matrix.device_port }} \
             --log-dir logs/${{ matrix.target_code }} \
             || (echo "::error::Flash failed for ${{ matrix.target }}" && exit 1)
@@ -273,6 +212,7 @@ jobs:
       - name: Comment test results on PR
         if: github.event_name == 'pull_request' && always()
         uses: actions/github-script@v7
+        continue-on-error: true
         with:
           script: |
             const status = '${{ job.status }}' === 'success' ? '✅' : '❌';
@@ -295,8 +235,16 @@ jobs:
             </details>
             `;
             
-            // Only post if this is the first matrix job to avoid spam
-            // In a real scenario, you'd aggregate all results
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            } catch (error) {
+              console.log('Could not post comment:', error.message);
+            }
 
   hil_summary:
     name: HIL Test Summary
@@ -312,18 +260,18 @@ jobs:
           
           if [ "${{ needs.hil_test.result }}" == "success" ]; then
             echo "✅ **All HIL tests passed**" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.hil_test.result }}" == "skipped" ]; then
+            echo "⏭️ **HIL tests skipped** (target not selected)" >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ **Some HIL tests failed**" >> $GITHUB_STEP_SUMMARY
           fi
           
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Test Matrix Results" >> $GITHUB_STEP_SUMMARY
-          echo "- **ESP32-S3**: ${{ needs.hil_test.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **CYD**: ${{ needs.hil_test.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **ESP32-P4**: Skipped (hardware not available)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Result**: ${{ needs.hil_test.result }}" >> $GITHUB_STEP_SUMMARY
       
       - name: Fail if tests failed
-        if: needs.hil_test.result != 'success'
+        if: needs.hil_test.result == 'failure'
         run: |
           echo "::error::One or more HIL tests failed"
           exit 1
