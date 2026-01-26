@@ -1,5 +1,11 @@
 # Rack Controller
 
+[![Build](https://github.com/oldmetalmachines-prog/rack-controller/actions/workflows/build.yml/badge.svg)](https://github.com/oldmetalmachines-prog/rack-controller/actions/workflows/build.yml)
+[![HIL Tests](https://github.com/oldmetalmachines-prog/rack-controller/actions/workflows/hil.yml/badge.svg)](https://github.com/oldmetalmachines-prog/rack-controller/actions/workflows/hil.yml)
+[![License](https://img.shields.io/github/license/oldmetalmachines-prog/rack-controller)](LICENSE)
+
+Automated firmware CI/CD pipeline for ESP32-based rack monitoring and control devices.
+
 Automated firmware CI/CD pipeline for ESP32-based rack monitoring and control devices.
 
 ## Overview
@@ -62,7 +68,16 @@ Topic: `lab/<device-id>/status`
 
 ### CI/CD Pipeline
 
-See [docs/WORKFLOW.md](docs/WORKFLOW.md) for the complete pipeline documentation.
+The repository includes a complete CI/CD pipeline:
+
+- **[build.yml](.github/workflows/build.yml)** - Automated builds on push/PR with matrix strategy and caching
+- **[hil.yml](.github/workflows/hil.yml)** - Hardware-in-the-loop testing on real devices
+- **[issue_on_fail.yml](.github/workflows/issue_on_fail.yml)** - Auto-creates GitHub issues on workflow failures
+- **[release_flash.yml](.github/workflows/release_flash.yml)** - Manual deployment to staging/production with approval gates
+
+For complete pipeline documentation, see:
+- [docs/WORKFLOW.md](docs/WORKFLOW.md) - Workflow details
+- [docs/WORKFLOW_INTEGRATION.md](docs/WORKFLOW_INTEGRATION.md) - Complete integration guide
 
 ## Directory Structure
 
@@ -88,6 +103,22 @@ rack-controller/
     ├── RUNNERS.md         # Self-hosted runner setup
     ├── WORKFLOW.md        # Pipeline documentation
     └── PINMAPS.md         # Hardware pin assignments
+
+## Self-Hosted Runners
+
+This project uses two self-hosted GitHub Actions runners:
+
+1. **Build Runner** - Compiles firmware (ZimaBlade #1 or similar)
+2. **HIL Runner** - Flashes and tests hardware (ZimaBlade #2 with USB access)
+
+Quick setup:
+```bash
+cp .env.example .env
+# Edit .env with your GitHub runner tokens
+docker-compose up -d
+```
+
+See [docs/RUNNERS.md](docs/RUNNERS.md) for detailed setup instructions.
 ```
 
 ## License
